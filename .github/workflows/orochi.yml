@@ -1,0 +1,100 @@
+name: Orochi Scan
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orochi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  orochi-scan:
+    # Pull requests from other forks can't read the deploy key.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    env:
+      IMAGE: orochi:ci
+      NO_COLOR: "1"
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: target
+          persist-credentials: false
+
+      - name: Checkout Orochi
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yusif-v/Orochi
+          ref: 7a2c590d125fc02f294295f64e5d809932e4b460
+          path: orochi-src
+          ssh-key: ${{ secrets.OROCHI_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Build Orochi image
+        run: docker build --tag "$IMAGE" orochi-src
+
+      - name: Scan repository
+        id: scan
+        run: |
+          mkdir -p "$RUNNER_TEMP/orochi-cache"
+          set +e
+          docker run --rm \
+            --user "$(id -u):$(id -g)" --env HOME=/tmp --env NO_COLOR \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --volume "$PWD/target:/scan" \
+            --volume "$RUNNER_TEMP/orochi-cache:/cache" \
+            "$IMAGE" scan --repo /scan --fail-on critical \
+            > orochi-report.txt 2> orochi-audit.log
+          code=$?
+          set -e
+          cat orochi-report.txt
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Orochi Scan'
+            echo '```'
+            cat orochi-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF to code scanning
+        if: always() && hashFiles('target/.orochi/orochi.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: target/.orochi/orochi.sarif
+          category: orochi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: orochi-reports
+          include-hidden-files: true
+          path: |
+            target/.orochi/
+            orochi-report.txt
+            orochi-audit.log
+          retention-days: 14
+
+      - name: Enforce gate
+        if: always() && steps.scan.outputs.exit_code != ''
+        env:
+          CODE: ${{ steps.scan.outputs.exit_code }}
+        run: |
+          case "$CODE" in
+            0) echo "Orochi: PASS" ;;
+            1) echo "::error::Orochi found critical findings"; exit 1 ;;
+            *) echo "::error::Orochi could not complete the scan (exit $CODE)"; exit 1 ;;
+          esac
